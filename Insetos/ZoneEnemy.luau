@@ -400,12 +400,78 @@ local function isInside(zone: BasePart, worldPos: Vector3, ceiling: number): boo
 		and p.Y < half.Y + ceiling
 end
 
--- Converte (x, z locais + altura acima do topo) em posição no mundo, respeitando a margem.
-local function zonePoint(zone: BasePart, x: number, z: number, margin: number, height: number): Vector3
+-- Converte (x, z locais + altura acima do topo) em posição no mundo. Com margem, fica dentro
+-- da zona; sem margem (nil), pode estar fora (inseto a perseguir noutra zona).
+local function zonePoint(zone: BasePart, x: number, z: number, margin: number?, height: number): Vector3
 	local half = zone.Size / 2
-	local cx = math.clamp(x, -half.X + margin, half.X - margin)
-	local cz = math.clamp(z, -half.Z + margin, half.Z - margin)
+	local cx, cz = x, z
+	if margin then
+		cx = math.clamp(x, -half.X + margin, half.X - margin)
+		cz = math.clamp(z, -half.Z + margin, half.Z - margin)
+	end
 	return zone.CFrame:PointToWorldSpace(Vector3.new(cx, half.Y + height, cz))
+end
+
+-- Zonas seguras (spawn, fazenda e descanso): os insetos não perseguem ninguém lá dentro.
+local SAFE_PREFIXES: { string } = (Config :: any).ZonasSeguras
+	or { "ZonaPrincipal", "ZonaFazenda", "ZonaDescanso" }
+local safeParts: { BasePart } = {}
+local safeScannedAt = -math.huge
+
+local function isSafe(position: Vector3): boolean
+	if os.clock() - safeScannedAt > 10 then
+		safeScannedAt = os.clock()
+		table.clear(safeParts)
+		for _, item in workspace:GetDescendants() do
+			if item:IsA("BasePart") then
+				for _, prefix in SAFE_PREFIXES do
+					if string.sub(item.Name, 1, #prefix) == prefix then
+						table.insert(safeParts, item)
+						break
+					end
+				end
+			end
+		end
+	end
+	for _, part in safeParts do
+		local p = part.CFrame:PointToObjectSpace(position)
+		local half = part.Size / 2
+		if
+			math.abs(p.X) <= half.X
+			and math.abs(p.Z) <= half.Z
+			and p.Y > -half.Y - 2
+			and p.Y < half.Y + 30
+		then
+			return true
+		end
+	end
+	return false
+end
+
+-- Quem leva ovos (atributo "CarregandoOvo", posto pelo módulo Ovos), vivo, fora das zonas
+-- seguras e a menos de "leash" studs do centro da zona do inseto. Devolve o mais próximo.
+local function findCarrier(from: Vector3, center: Vector3, leash: number): (Humanoid?, BasePart?)
+	local best: Humanoid?, bestRoot: BasePart?, bestDist = nil, nil, math.huge
+	for _, player in Players:GetPlayers() do
+		if player:GetAttribute("CarregandoOvo") ~= nil then
+			local character = player.Character
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			local root = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+			if
+				humanoid
+				and root
+				and humanoid.Health > 0
+				and (root.Position - center).Magnitude <= leash
+				and not isSafe(root.Position)
+			then
+				local dist = (root.Position - from).Magnitude
+				if dist < bestDist then
+					best, bestRoot, bestDist = humanoid, root, dist
+				end
+			end
+		end
+	end
+	return best, bestRoot
 end
 
 local function randomXZ(zone: BasePart, margin: number): (number, number)
@@ -547,6 +613,27 @@ local function run(cfg: EnemyConfig, name: string)
 	local currentSpeed = 0
 	local stepPhase = 0
 
+	-- Dormir junto ao ninho: enquanto a zona tiver o atributo Acordado = false (posto pelo
+	-- módulo Ovos), o inseto ignora os jogadores, vai para o seu lugar à volta do ninho (no
+	-- centro da zona) e fica quieto, virado para o ovo. Sem o atributo, está sempre acordado.
+	local homeAngle = math.random() * math.pi * 2
+	local homeExtra = 2 + math.random() * 3
+	local function homeXZ(): (number, number)
+		local radius = (zone:GetAttribute("NinhoRaio") :: number? or 6) + homeExtra
+		return math.cos(homeAngle) * radius, math.sin(homeAngle) * radius
+	end
+
+	-- Vida própria (zonas com ovos): cada inseto alterna sozinho entre "dormir" (no lugar à
+	-- volta do ninho) e "passear" (pela zona). Quem passeia ataca quem se aproximar demasiado.
+	-- Quando alguém com ovos está na zona, todos acordam e perseguem-no, mesmo para fora da
+	-- zona (até "Alcance" studs do centro), mas nunca dentro das zonas seguras.
+	local sleepChance = cfg.SonoChance or 0.5
+	local aggroRange = cfg.AggroRange or 12
+	local leash = cfg.Alcance or 250
+	local mode = if math.random() < sleepChance then "dormir" else "passear"
+	local modeUntil = os.clock() + math.random(10, 40)
+	local hunting = false
+
 	local hasInsectLegs = false
 	for _, joint in joints or {} do
 		if joint.kind == "hip" then
@@ -578,12 +665,48 @@ local function run(cfg: EnemyConfig, name: string)
 			return
 		end
 		local now = os.clock()
-		local position = zonePoint(zone, x, z, cfg.EdgeMargin, height)
-		local humanoid, root = findTarget(zone, position, ceiling)
+		local position = zonePoint(zone, x, z, nil, height)
+		local humanoid: Humanoid?, root: BasePart? = nil, nil
+		local asleep = false -- a ir para o lugar de dormir (ou já lá)
+		local alarm = zone:GetAttribute("Acordado")
+		if alarm == nil then
+			-- Zona sem ovos: comportamento antigo (ataca quem entrar na zona).
+			humanoid, root = findTarget(zone, position, ceiling)
+		else
+			-- Alguém com ovos na zona (ou já a ser perseguido): persegue quem leva ovos.
+			if alarm == true or hunting then
+				humanoid, root = findCarrier(position, zone.Position, leash)
+			end
+			hunting = humanoid ~= nil
+			if not hunting then
+				-- Vida própria: muda de vez em quando entre dormir e passear.
+				if now >= modeUntil then
+					mode = if math.random() < sleepChance then "dormir" else "passear"
+					modeUntil = now + (if mode == "dormir" then math.random(20, 60) else math.random(15, 40))
+				end
+				if mode == "passear" then
+					-- A passear: ataca quem se aproximar demasiado (dentro da zona dele).
+					local h, r = findTarget(zone, position, ceiling)
+					if
+						h
+						and r
+						and (r.Position - position).Magnitude <= aggroRange
+						and not isSafe(r.Position)
+					then
+						humanoid, root = h, r
+					end
+				else
+					asleep = true
+				end
+			end
+		end
+		local sleeping = false -- já está no lugar, a dormir
 
 		-- Pousar / levantar voo. Se vir um jogador, levanta voo logo para atacar.
 		if canLand then
-			if humanoid then
+			if asleep then
+				airborne = false -- voadores pousam para dormir
+			elseif humanoid then
 				if not airborne then
 					airborne = true
 					stateUntil = now + randomRange(cfg.FlyTime, 8)
@@ -618,6 +741,18 @@ local function run(cfg: EnemyConfig, name: string)
 					attackSound:Play()
 				end
 			end
+		elseif asleep then
+			-- Vai para o lugar à volta do ninho; quando chega, fica quieto.
+			goalX, goalZ = homeXZ()
+			goalHeight = groundHeight
+			if Vector2.new(goalX - x, goalZ - z).Magnitude < 0.8 then
+				speed = 0
+				sleeping = true
+			elseif flying and not onGround then
+				speed = 0 -- primeiro desce
+			else
+				speed = if flying then groundSpeed else cfg.WanderSpeed
+			end
 		else
 			local arrived = Vector2.new(wanderX - x, wanderZ - z).Magnitude < 1
 			if arrived and not pausedHere then
@@ -651,7 +786,14 @@ local function run(cfg: EnemyConfig, name: string)
 
 		-- Vira aos poucos na direção do objetivo.
 		local turnAmount = 0
-		if distance > 0.05 then
+		if sleeping then
+			-- A dormir: vira-se devagar para o ninho (centro da zona).
+			local wanted = math.atan2(-z, -x)
+			local diff = (wanted - yaw + math.pi) % (math.pi * 2) - math.pi
+			turnAmount = math.clamp(diff, -turnSpeed * 0.3 * dt, turnSpeed * 0.3 * dt)
+			yaw += turnAmount
+			speed = 0
+		elseif distance > 0.05 then
 			local wanted = math.atan2(flatDelta.Y, flatDelta.X)
 			local diff = (wanted - yaw + math.pi) % (math.pi * 2) - math.pi
 			turnAmount = math.clamp(diff, -turnSpeed * dt, turnSpeed * dt)
@@ -666,21 +808,30 @@ local function run(cfg: EnemyConfig, name: string)
 		currentSpeed += math.clamp(speed - currentSpeed, -acceleration * dt, acceleration * dt)
 		local stepLen = math.min(currentSpeed * dt, distance)
 		local half = zone.Size / 2
-		x = math.clamp(x + math.cos(yaw) * stepLen, -half.X + cfg.EdgeMargin, half.X - cfg.EdgeMargin)
-		z = math.clamp(z + math.sin(yaw) * stepLen, -half.Z + cfg.EdgeMargin, half.Z - cfg.EdgeMargin)
+		-- Dentro da zona fica preso a ela; a perseguir (ou ainda a voltar de uma perseguição
+		-- lá fora) anda livre, até voltar a entrar na zona.
+		local limX, limZ = half.X - cfg.EdgeMargin, half.Z - cfg.EdgeMargin
+		local function move(dist: number)
+			local nx, nz = x + math.cos(yaw) * dist, z + math.sin(yaw) * dist
+			local outside = math.abs(x) > limX or math.abs(z) > limZ
+			if hunting or outside then
+				x, z = nx, nz
+			else
+				x, z = math.clamp(nx, -limX, limX), math.clamp(nz, -limZ, limZ)
+			end
+		end
+		move(stepLen)
 
 		-- Salto: começa quando chega a hora (mais vezes a perseguir) e há espaço à frente.
 		local hopT = (now - hopStart) / hopTime
 		local inHop = hopT < 1
-		if canHop and not inHop and now >= nextHop and distance > cfg.AttackRange then
+		if canHop and not asleep and not inHop and now >= nextHop and distance > cfg.AttackRange then
 			hopStart, hopT, inHop = now, 0, true
 			local wait = randomRange(cfg.HopInterval, 3) * (if humanoid then 0.5 else 1)
 			nextHop = now + hopTime + wait
 		end
 		if inHop then
-			local hopStep = hopDistance / hopTime * dt
-			x = math.clamp(x + math.cos(yaw) * hopStep, -half.X + cfg.EdgeMargin, half.X - cfg.EdgeMargin)
-			z = math.clamp(z + math.sin(yaw) * hopStep, -half.Z + cfg.EdgeMargin, half.Z - cfg.EdgeMargin)
+			move(hopDistance / hopTime * dt)
 		end
 		-- Coice das patas de trás: estica no arranque e volta a dobrar no ar.
 		local kick = 0
@@ -719,7 +870,7 @@ local function run(cfg: EnemyConfig, name: string)
 		-- Ataque: avança o corpo e baixa a cabeça por um instante (0 -> 1 -> 0).
 		local bite = if now < biteUntil then math.sin((biteUntil - now) / ATTACK_TIME * math.pi) else 0
 		local forward = zone.CFrame:VectorToWorldSpace(Vector3.new(math.cos(yaw), 0, math.sin(yaw)))
-		local basePos = zonePoint(zone, x + wobbleX, z + wobbleZ, 0, height + offsetY)
+		local basePos = zonePoint(zone, x + wobbleX, z + wobbleZ, nil, height + offsetY)
 			+ forward * lunge * bite
 		pitch -= lungePitch * bite
 		model:PivotTo(CFrame.lookAt(basePos, basePos + forward) * CFrame.Angles(pitch, 0, roll) * facing)
@@ -751,8 +902,71 @@ local function run(cfg: EnemyConfig, name: string)
 				wingFlap,
 				wingRate,
 				kick,
-				if humanoid then 1 else 0
+				if humanoid then 1 elseif sleeping then -0.6 else 0 -- a dormir: antenas lentas
 			)
+		end
+	end)
+end
+
+-- Inseto "de estimação" (ex.: na fazenda): passeia devagar dentro de um retângulo, faz
+-- pausas, mexe as patas ao andar e as antenas sempre. Não ataca ninguém.
+-- area = centro do retângulo (no chão); halfX/halfZ = metade do tamanho; speed em studs/s.
+-- Para sozinho quando o modelo é destruído.
+function ZoneEnemy.pet(model: Model, area: CFrame, halfX: number, halfZ: number, speed: number)
+	local joints = setupRig(model, CFrame.identity, nil)
+	local start = area:ToObjectSpace(model:GetPivot())
+	local x, z, y = start.X, start.Z, start.Y
+	local yaw = math.random() * math.pi * 2
+	local currentSpeed = 0
+	local stepPhase = 0
+	local goalX, goalZ = x, z
+	local pauseUntil = os.clock() + math.random() * 3
+	local turnSpeed = math.rad(160)
+	local legSwing, legLift = math.rad(20), math.rad(15)
+	local elapsed = 0
+	local connection: RBXScriptConnection
+	connection = RunService.Heartbeat:Connect(function(dt)
+		if not model.Parent then
+			connection:Disconnect()
+			return
+		end
+		-- 30 atualizações por segundo chegam e poupam o servidor (há muitos na fazenda).
+		elapsed += dt
+		if elapsed < 1 / 30 then
+			return
+		end
+		dt, elapsed = elapsed, 0
+		local now = os.clock()
+
+		local delta = Vector2.new(goalX - x, goalZ - z)
+		local target = 0
+		if now >= pauseUntil then
+			if delta.Magnitude < 0.5 then
+				-- Chegou: pausa e escolhe outro ponto.
+				pauseUntil = now + 1 + math.random() * 4
+				goalX = (math.random() * 2 - 1) * halfX
+				goalZ = (math.random() * 2 - 1) * halfZ
+			else
+				target = speed
+				local wanted = math.atan2(delta.Y, delta.X)
+				local diff = (wanted - yaw + math.pi) % (math.pi * 2) - math.pi
+				yaw += math.clamp(diff, -turnSpeed * dt, turnSpeed * dt)
+				target *= math.clamp(1 - math.abs(diff) / math.pi, 0.2, 1)
+			end
+		end
+		currentSpeed += math.clamp(target - currentSpeed, -8 * dt, 8 * dt)
+		local step = math.min(currentSpeed * dt, delta.Magnitude)
+		x = math.clamp(x + math.cos(yaw) * step, -halfX, halfX)
+		z = math.clamp(z + math.sin(yaw) * step, -halfZ, halfZ)
+		stepPhase += currentSpeed * 0.6 * dt * math.pi * 2
+
+		local gait = math.clamp(currentSpeed / math.max(speed, 0.01), 0, 1)
+		local bob = math.abs(math.sin(stepPhase)) * 0.05 * gait
+		local pos = area:PointToWorldSpace(Vector3.new(x, y + bob, z))
+		local forward = area:VectorToWorldSpace(Vector3.new(math.cos(yaw), 0, math.sin(yaw)))
+		model:PivotTo(CFrame.lookAt(pos, pos + forward))
+		if joints then
+			animateRig(joints, stepPhase, gait, 0, now, legSwing, legLift, 0, 0, 0, 0, -0.3)
 		end
 	end)
 end
